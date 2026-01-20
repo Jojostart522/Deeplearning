@@ -352,19 +352,27 @@ class ANCModel_TCN(nn.Module):
 # ============================================================================
 
 def train_model(model, train_loader, val_loader, num_epochs=50, lr=0.001, device='cpu'):
-    """训练模型（增强版 - 更好的学习率策略和早停）"""
+    """训练模型（GPU优化版 - 混合精度训练 + 更好的学习率策略和早停）"""
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=5e-6)  # 降低权重衰减
-    # 更耐心的学习率衰减策略
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=5e-6)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',
                                                      factor=0.6, patience=15, verbose=True, min_lr=1e-7)
+
+    # GPU优化：启用混合精度训练（AMP）
+    use_amp = device.type == 'cuda'
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+
+    # GPU优化：启用cudnn benchmark（自动寻找最优卷积算法）
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
+        print("GPU优化已启用：混合精度训练(AMP) + cudnn.benchmark")
 
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
     best_model_state = None
     patience_counter = 0
-    early_stop_patience = 50  # 增加早停耐心值以适应更长的训练
+    early_stop_patience = 50
 
     print(f"\n开始训练 (设备: {device})...")
     print(f"训练样本数: {len(train_loader.dataset)}, 验证样本数: {len(val_loader.dataset)}")
@@ -374,13 +382,25 @@ def train_model(model, train_loader, val_loader, num_epochs=50, lr=0.001, device
         model.train()
         train_loss = 0.0
         for batch_x, batch_y in train_loader:
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            # GPU优化：异步数据传输
+            batch_x = batch_x.to(device, non_blocking=True)
+            batch_y = batch_y.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-            outputs = model(batch_x)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)  # GPU优化：更快的梯度清零
+
+            # GPU优化：混合精度训练
+            if use_amp:
+                with torch.cuda.amp.autocast():
+                    outputs = model(batch_x)
+                    loss = criterion(outputs, batch_y)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(batch_x)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
 
             train_loss += loss.item()
 
@@ -392,9 +412,17 @@ def train_model(model, train_loader, val_loader, num_epochs=50, lr=0.001, device
         val_loss = 0.0
         with torch.no_grad():
             for batch_x, batch_y in val_loader:
-                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-                outputs = model(batch_x)
-                loss = criterion(outputs, batch_y)
+                batch_x = batch_x.to(device, non_blocking=True)
+                batch_y = batch_y.to(device, non_blocking=True)
+
+                if use_amp:
+                    with torch.cuda.amp.autocast():
+                        outputs = model(batch_x)
+                        loss = criterion(outputs, batch_y)
+                else:
+                    outputs = model(batch_x)
+                    loss = criterion(outputs, batch_y)
+
                 val_loss += loss.item()
 
         val_loss /= len(val_loader)
@@ -415,7 +443,7 @@ def train_model(model, train_loader, val_loader, num_epochs=50, lr=0.001, device
             print(f"Epoch [{epoch+1}/{num_epochs}], "
                   f"Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, "
                   f"Patience: {patience_counter}/{early_stop_patience}")
-        
+
         # 早停机制
         if patience_counter >= early_stop_patience:
             print(f"\n早停触发！验证损失连续{early_stop_patience}轮未改善")
@@ -428,26 +456,67 @@ def train_model(model, train_loader, val_loader, num_epochs=50, lr=0.001, device
 
     return train_losses, val_losses
 
-def predict_full_signal(model, input_signals, window_size=300, device='cpu'):
+def predict_full_signal(model, input_signals, window_size=300, device='cpu', batch_size=512):
     """
-    使用训练好的模型预测完整信号
+    使用训练好的模型预测完整信号（GPU优化版 - 批量处理）
+
+    Parameters:
+    -----------
+    model : nn.Module
+        训练好的模型
+    input_signals : ndarray
+        输入信号 (num_channels, num_samples)
+    window_size : int
+        窗口大小
+    device : torch.device
+        计算设备
+    batch_size : int
+        批处理大小（GPU优化：一次处理多个窗口）
+
+    Returns:
+    --------
+    predictions : ndarray
+        预测结果 (num_samples,)
     """
     model.eval()
     num_samples = input_signals.shape[1]
     predictions = np.zeros(num_samples)
 
+    # GPU优化：批量处理窗口
     with torch.no_grad():
+        # 准备所有窗口
+        windows = []
+        indices = []
         for i in range(window_size - 1, num_samples):
             start_idx = i - window_size + 1
             end_idx = i + 1
-
             x_window = input_signals[:, start_idx:end_idx]
-            x_tensor = torch.FloatTensor(x_window).unsqueeze(0).to(device)
+            windows.append(x_window)
+            indices.append(i)
 
-            pred = model(x_tensor)
-            predictions[i] = pred.cpu().numpy()[0, 0]
+        # 转换为tensor
+        windows_tensor = torch.FloatTensor(np.array(windows)).to(device)
 
-    # 前window_size-1个点使用简单平均或零填充
+        # 批量预测
+        all_preds = []
+        for i in range(0, len(windows_tensor), batch_size):
+            batch = windows_tensor[i:i+batch_size]
+
+            # GPU优化：混合精度推理
+            if device.type == 'cuda':
+                with torch.cuda.amp.autocast():
+                    preds = model(batch)
+            else:
+                preds = model(batch)
+
+            all_preds.append(preds.cpu().numpy())
+
+        # 合并结果
+        all_preds = np.concatenate(all_preds, axis=0)
+        for idx, pred in zip(indices, all_preds):
+            predictions[idx] = pred[0]
+
+    # 前window_size-1个点使用零填充
     predictions[:window_size-1] = 0
 
     return predictions

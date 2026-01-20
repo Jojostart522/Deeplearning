@@ -135,8 +135,12 @@ def train_single_band(input_signals, target_signal, band_name, lowcut, highcut,
     train_dataset = ANCDataset(train_input, train_target, window_size, stride)
     val_dataset = ANCDataset(val_input, val_target, window_size, stride)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                             num_workers=8, pin_memory=True, persistent_workers=True,
+                             prefetch_factor=4)  # GPU优化：增加workers和预取
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                           num_workers=8, pin_memory=True, persistent_workers=True,
+                           prefetch_factor=4)
 
     print(f"训练样本: {len(train_dataset)}, 验证样本: {len(val_dataset)}")
 
@@ -189,14 +193,14 @@ def main_multiband():
     print("="*70)
 
     # ========== 配置参数 ==========
-    filename = 'data/260107_ddr_32x5_05.dat'
+    filename = 'data/260107_ddr_32x60_01.dat'  # 使用60秒数据文件
     num_channels = 32
-    num_samples = 15000
+    num_samples = 180000  # 60秒 * 3000Hz = 180000个点
     fs = 3000
 
     window_size = 300
     stride = 3
-    batch_size = 32
+    batch_size = 512  # GPU优化：进一步增大batch size（256→512）
     num_epochs = 300
     learning_rate = 0.0005
 
@@ -329,9 +333,10 @@ def main_multiband():
         params = norm_params[band_name]
         input_norm = (input_filtered - params['input_mean']) / params['input_std']
 
-        # 预测
+        # 预测（GPU优化：批量预测）
         model = models[band_name]
-        prediction_norm = predict_full_signal(model, input_norm, window_size=window_size, device=device)
+        prediction_norm = predict_full_signal(model, input_norm, window_size=window_size,
+                                             device=device, batch_size=1024)
 
         # 反归一化
         prediction = prediction_norm * params['target_std'] + params['target_mean']
